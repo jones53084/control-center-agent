@@ -24,9 +24,37 @@ AGENT_PORT = int(os.environ.get("AGENT_PORT", 8002))
 CLAUDE_BIN = Path(os.environ.get("CLAUDE_BIN", Path.home() / ".local/bin/claude"))
 
 
+def _post_result(callback_url: str, output: str, status: str):
+    import urllib.request
+    payload = json.dumps({"output": output, "status": status}).encode()
+    req = urllib.request.Request(
+        callback_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10)
+
+
 def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, project_path: str):
-    """Run claude against the md content, stream output, post result back."""
-    cwd = project_path if project_path else str(Path.home() / "Desktop/olive")
+    """Run claude from project_path, post result back."""
+    project_path = (project_path or "").strip()
+
+    if not project_path:
+        try:
+            _post_result(callback_url, "Agent error: project_path is required", "error")
+        except Exception:
+            pass
+        return
+
+    cwd = Path(project_path)
+    if not cwd.is_dir():
+        try:
+            _post_result(callback_url, f"Agent error: project path does not exist: {project_path}", "error")
+        except Exception:
+            pass
+        return
+
     print(f"[agent] Running job {job_id} in {cwd}")
 
     try:
@@ -40,7 +68,7 @@ def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, pro
             ],
             capture_output=True,
             text=True,
-            cwd=cwd,
+            cwd=str(cwd),
         )
         output = proc.stdout + proc.stderr
         status = "done" if proc.returncode == 0 else "error"
@@ -50,17 +78,8 @@ def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, pro
 
     print(f"[agent] Job {job_id} finished with status={status}")
 
-    # Post result back to Django
     try:
-        import urllib.request
-        payload = json.dumps({"output": output, "status": status}).encode()
-        req = urllib.request.Request(
-            callback_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=10)
+        _post_result(callback_url, output, status)
         print(f"[agent] Result posted for job {job_id}")
     except Exception as exc:
         print(f"[agent] Failed to post result for job {job_id}: {exc}")

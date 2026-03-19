@@ -23,6 +23,10 @@ from pathlib import Path
 AGENT_PORT = int(os.environ.get("AGENT_PORT", 8002))
 CLAUDE_BIN = Path(os.environ.get("CLAUDE_BIN", Path.home() / ".local/bin/claude"))
 
+# job_id -> Popen instance for cancellable jobs
+_running: dict = {}
+_lock = threading.Lock()
+
 
 def _post_result(callback_url: str, output: str, status: str):
     import urllib.request
@@ -36,7 +40,7 @@ def _post_result(callback_url: str, output: str, status: str):
     urllib.request.urlopen(req, timeout=10)
 
 
-def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, project_path: str):
+def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, project_path: str, session_id: str = ""):
     """Run claude from project_path, post result back."""
     project_path = (project_path or "").strip()
 
@@ -58,20 +62,33 @@ def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, pro
     print(f"[agent] Running job {job_id} in {cwd}")
 
     try:
-        proc = subprocess.run(
-            [
-                str(CLAUDE_BIN),
-                "-p", md_content,
-                "--dangerously-skip-permissions",
-                "--output-format", "stream-json",
-                "--verbose",
-            ],
-            capture_output=True,
+        cmd = [str(CLAUDE_BIN)]
+        if session_id:
+            cmd += ["--resume", session_id]
+            print(f"[agent] Resuming session {session_id} for job {job_id}")
+        cmd += ["-p", md_content, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             cwd=str(cwd),
         )
-        output = proc.stdout + proc.stderr
-        status = "done" if proc.returncode == 0 else "error"
+        with _lock:
+            _running[job_id] = proc
+        try:
+            stdout, stderr = proc.communicate()
+        finally:
+            with _lock:
+                _running.pop(job_id, None)
+        output = stdout + stderr
+        if proc.returncode == 0:
+            status = "done"
+        elif proc.returncode < 0:
+            status = "cancelled"
+        else:
+            status = "error"
     except Exception as exc:
         output = f"Agent error: {exc}"
         status = "error"
@@ -117,17 +134,35 @@ class AgentHandler(BaseHTTPRequestHandler):
             md_content   = payload.get("md_content", "")
             callback_url = payload.get("callback", "")
             project_path = payload.get("project_path", "")
+            session_id   = payload.get("session_id", "")
 
             if not md_content or not callback_url:
                 return self.send_json(400, {"error": "missing md_content or callback"})
 
             threading.Thread(
                 target=run_claude,
-                args=(job_id, run_id, md_content, callback_url, project_path),
+                args=(job_id, run_id, md_content, callback_url, project_path, session_id),
                 daemon=True,
             ).start()
 
             return self.send_json(202, {"accepted": True, "job_id": job_id})
+
+        if self.path == "/cancel":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return self.send_json(400, {"error": "invalid JSON"})
+
+            job_id = payload.get("job_id", "")
+            with _lock:
+                proc = _running.get(job_id)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                print(f"[agent] Cancelled job {job_id}")
+                return self.send_json(200, {"cancelled": True})
+            return self.send_json(404, {"error": "job not running"})
 
         self.send_json(404, {"error": "not found"})
 

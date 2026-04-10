@@ -28,20 +28,35 @@ _running: dict = {}
 _lock = threading.Lock()
 
 
-def _post_result(callback_url: str, output: str, status: str):
+def _post_json(url: str, payload: dict):
     import urllib.request
-    payload = json.dumps({"output": output, "status": status}).encode()
+    data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        callback_url,
-        data=payload,
+        url,
+        data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     urllib.request.urlopen(req, timeout=10)
 
 
+def _post_result(callback_url: str, output: str, status: str):
+    _post_json(callback_url, {"output": output, "status": status})
+
+
+def _post_stream_chunk(job_id: str, line: str):
+    """Post a single stream-json line to the API for live broadcasting."""
+    try:
+        _post_json(
+            f"http://localhost:8080/api/jobs/{job_id}/stream/",
+            {"line": line},
+        )
+    except Exception as exc:
+        print(f"[agent] stream chunk failed for {job_id}: {exc}")
+
+
 def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, project_path: str, session_id: str = ""):
-    """Run claude from project_path, post result back."""
+    """Run claude from project_path, stream output live, post final result back."""
     project_path = (project_path or "").strip()
 
     if not project_path:
@@ -73,16 +88,27 @@ def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, pro
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
             cwd=str(cwd),
         )
         with _lock:
             _running[job_id] = proc
+
+        # Stream stdout line-by-line to the API for live updates
+        lines = []
         try:
-            stdout, stderr = proc.communicate()
+            for line in proc.stdout:
+                lines.append(line)
+                stripped = line.strip()
+                if stripped:
+                    _post_stream_chunk(job_id, stripped)
+            stderr_out = proc.stderr.read()
+            proc.wait()
         finally:
             with _lock:
                 _running.pop(job_id, None)
-        output = stdout + stderr
+
+        output = "".join(lines) + stderr_out
         if proc.returncode == 0:
             status = "done"
         elif proc.returncode < 0:

@@ -23,7 +23,7 @@ from pathlib import Path
 AGENT_PORT = int(os.environ.get("AGENT_PORT", 8002))
 CLAUDE_BIN = Path(os.environ.get("CLAUDE_BIN", Path.home() / ".local/bin/claude"))
 
-# job_id -> Popen instance for cancellable jobs
+# job_id -> {"proc": Popen, "session_id": str} for cancellable/interjectible jobs
 _running: dict = {}
 _lock = threading.Lock()
 
@@ -92,7 +92,7 @@ def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, pro
             cwd=str(cwd),
         )
         with _lock:
-            _running[job_id] = proc
+            _running[job_id] = {"proc": proc, "session_id": ""}
 
         # Stream stdout line-by-line to the API for live updates
         lines = []
@@ -101,6 +101,16 @@ def run_claude(job_id: str, run_id: str, md_content: str, callback_url: str, pro
                 lines.append(line)
                 stripped = line.strip()
                 if stripped:
+                    # Capture session_id from init or result messages
+                    try:
+                        obj = json.loads(stripped)
+                        if obj.get("session_id"):
+                            with _lock:
+                                entry = _running.get(job_id)
+                                if entry:
+                                    entry["session_id"] = obj["session_id"]
+                    except (json.JSONDecodeError, KeyError):
+                        pass
                     _post_stream_chunk(job_id, stripped)
             stderr_out = proc.stderr.read()
             proc.wait()
@@ -183,12 +193,43 @@ class AgentHandler(BaseHTTPRequestHandler):
 
             job_id = payload.get("job_id", "")
             with _lock:
-                proc = _running.get(job_id)
+                entry = _running.get(job_id)
+            proc = entry["proc"] if entry else None
             if proc and proc.poll() is None:
                 proc.terminate()
                 print(f"[agent] Cancelled job {job_id}")
                 return self.send_json(200, {"cancelled": True})
             return self.send_json(404, {"error": "job not running"})
+
+        if self.path == "/interject":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return self.send_json(400, {"error": "invalid JSON"})
+
+            job_id = payload.get("job_id", "")
+            with _lock:
+                entry = _running.get(job_id)
+            if not entry:
+                return self.send_json(404, {"error": "job not running"})
+
+            proc = entry["proc"]
+            session_id = entry["session_id"]
+
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                print(f"[agent] Interjected job {job_id}, session={session_id}")
+
+            return self.send_json(200, {
+                "interjected": True,
+                "session_id": session_id,
+            })
 
         self.send_json(404, {"error": "not found"})
 
